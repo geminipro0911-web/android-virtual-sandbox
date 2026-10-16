@@ -17,11 +17,14 @@ object HiddenApiBypass {
         }
 
         return try {
+            val classArrayType = Class.forName("[Ljava.lang.Class;")
+            val stringArrayType = Class.forName("[Ljava.lang.String;")
+
             val forNameMethod = Class::class.java.getDeclaredMethod("forName", String::class.java)
             val getDeclaredMethod = Class::class.java.getDeclaredMethod(
                 "getDeclaredMethod",
                 String::class.java,
-                Array<Class<*>>::class.java
+                classArrayType
             )
 
             val vmRuntimeClass = forNameMethod.invoke(null, "dalvik.system.VMRuntime") as Class<*>
@@ -33,7 +36,7 @@ object HiddenApiBypass {
             val setHiddenApiExemptionsMethod = getDeclaredMethod.invoke(
                 vmRuntimeClass,
                 "setHiddenApiExemptions",
-                arrayOf(Array<String>::class.java)
+                arrayOf(stringArrayType)
             ) as Method
 
             val vmRuntime = getRuntimeMethod.invoke(null)
