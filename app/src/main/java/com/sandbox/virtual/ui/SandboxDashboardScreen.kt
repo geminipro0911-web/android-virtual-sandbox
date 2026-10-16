@@ -175,7 +175,7 @@ fun SandboxDashboardScreen(
                     ) {
                         Column(
                             modifier = Modifier.padding(24.dp),
-                            horizontalAlignment = Alignment.CenterVertically
+                            horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             CircularProgressIndicator(color = GreenPrimary)
                             Spacer(modifier = Modifier.height(16.dp))
@@ -427,7 +427,7 @@ fun EmptyStateView(onPickApk: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .padding(32.dp),
-        horizontalAlignment = Alignment.CenterVertically,
+        horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
         Box(
