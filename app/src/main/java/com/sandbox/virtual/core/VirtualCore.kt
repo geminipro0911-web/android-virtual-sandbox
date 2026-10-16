@@ -1,8 +1,11 @@
 package com.sandbox.virtual.core
 
 import android.app.Activity
+import android.app.ActivityManager
+import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.util.Log
@@ -17,12 +20,13 @@ import com.sandbox.virtual.server.VirtualPackageManagerService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 
 object VirtualCore {
     private const val TAG = "VirtualCore"
 
-    private lateinit var appContext: Context
+    private var appContext: Context? = null
     private var isInitialized = false
 
     private val securityLogList = CopyOnWriteArrayList<SecurityLog>()
@@ -31,32 +35,46 @@ object VirtualCore {
 
     fun initialize(context: Context) {
         if (isInitialized) return
-        appContext = context.applicationContext
+        val ctx = context.applicationContext
+        appContext = ctx
         isInitialized = true
 
-        Log.i(TAG, "Initializing VirtualCore engine in process pid=${Process.myPid()}")
+        val currentProc = getProcessName(ctx)
+        val isMain = currentProc == ctx.packageName
 
-        // 1. Initialize Virtual File System
-        VirtualFileSystem.init(appContext)
+        Log.i(TAG, "Initializing VirtualCore in process: '$currentProc' (isMain=$isMain, PID=${Process.myPid()})")
 
-        // 2. Initialize Virtual Package Manager
-        VirtualPackageManagerService.init(appContext)
+        // 1. Bypass Android 9-14 non-SDK hidden API restrictions
+        HiddenApiBypass.bypass()
 
-        // 3. Initialize Device Spoofing Manager
-        DeviceSpoofManager.init(appContext)
+        // 2. Initialize Virtual File System
+        VirtualFileSystem.init(ctx)
 
-        // 4. Hook ServiceManager & Binder IPC
-        BinderHookManager.initHooks()
+        // 3. Initialize Virtual Package Manager
+        VirtualPackageManagerService.init(ctx)
 
-        // 5. Hook Instrumentation & Handler
-        InstrumentationProxy.inject(appContext.packageName)
-        HCallbackHook.inject()
+        // 4. Initialize Device Spoofing Manager
+        DeviceSpoofManager.init(ctx)
+
+        // 5. In virtual worker processes (:virtual_p0 to :virtual_p9), activate virtualization hooks
+        if (!isMain) {
+            Log.i(TAG, "Virtual guest process detected ($currentProc) - activating isolation hooks")
+            try {
+                BinderHookManager.initHooks()
+                InstrumentationProxy.inject(ctx.packageName)
+                HCallbackHook.inject()
+            } catch (t: Throwable) {
+                Log.w(TAG, "Virtual process hook injection notice: ${t.message}")
+            }
+        } else {
+            Log.i(TAG, "Main container host process running in clean management mode")
+        }
 
         recordSecurityLog(
             packageName = "system",
             type = SecurityEventType.PROCESS_LIFECYCLE,
             summary = "VirtualCore Initialized",
-            detail = "Host: ${appContext.packageName}, PID: ${Process.myPid()}"
+            detail = "Process: $currentProc, PID: ${Process.myPid()}"
         )
     }
 
@@ -66,7 +84,31 @@ object VirtualCore {
         }
     }
 
-    fun getContext(): Context = appContext
+    fun getContext(): Context {
+        return appContext ?: throw IllegalStateException("VirtualCore must be initialized with a Context")
+    }
+
+    fun getProcessName(context: Context): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                return Application.getProcessName()
+            } catch (e: Exception) {
+                // fallback
+            }
+        }
+        val pid = Process.myPid()
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        am?.runningAppProcesses?.forEach { proc ->
+            if (proc.pid == pid) {
+                return proc.processName
+            }
+        }
+        return try {
+            File("/proc/$pid/cmdline").readText().trim().replace("\u0000", "")
+        } catch (e: Exception) {
+            context.packageName
+        }
+    }
 
     fun recordSecurityLog(
         packageName: String,
@@ -91,8 +133,11 @@ object VirtualCore {
     }
 
     fun getAllSecurityLogs(): List<SecurityLog> {
-        // Merge native C++ POSIX logs
-        val nativeLogs = NativeBridge.fetchNativeLogs()
+        val nativeLogs = try {
+            NativeBridge.fetchNativeLogs()
+        } catch (e: Exception) {
+            emptyList()
+        }
         val combined = ArrayList(securityLogList)
         combined.addAll(nativeLogs)
         combined.sortByDescending { it.timestamp }
@@ -119,13 +164,11 @@ object VirtualCore {
                 app.apkPath
             )
 
-            // Notify process manager
             val processIndex = ProcessManager.getProcessIndex(targetPkg)
             ProcessManager.onProcessStarted(processIndex, Process.myPid(), targetPkg)
 
             Log.i(TAG, "Launching guest activity $targetActivityName with classLoader $classLoader")
 
-            // Display sandbox guest container banner inside the stub window
             val layout = FrameLayout(hostActivity).apply {
                 setBackgroundColor(0xFF121212.toInt())
             }

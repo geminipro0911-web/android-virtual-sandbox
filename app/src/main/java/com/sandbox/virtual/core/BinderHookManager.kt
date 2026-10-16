@@ -1,7 +1,6 @@
 package com.sandbox.virtual.core
 
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.IBinder
 import android.os.IInterface
 import android.util.Log
@@ -9,7 +8,6 @@ import com.sandbox.virtual.model.SecurityEventType
 import com.sandbox.virtual.server.DeviceSpoofManager
 import com.sandbox.virtual.server.VirtualAppOpsService
 import com.sandbox.virtual.server.VirtualPackageManagerService
-import java.lang.reflect.Field
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
@@ -24,25 +22,38 @@ object BinderHookManager {
             hookServiceManagerCache("package", "android.content.pm.IPackageManager") { method, args, target ->
                 handlePackageManagerCall(method, args, target)
             }
+        } catch (t: Throwable) {
+            Log.w(TAG, "Package manager hook skipped: ${t.message}")
+        }
 
+        try {
             hookServiceManagerCache("appops", "com.android.internal.app.IAppOpsService") { method, args, target ->
                 handleAppOpsCall(method, args, target)
             }
+        } catch (t: Throwable) {
+            Log.w(TAG, "AppOps hook skipped: ${t.message}")
+        }
 
+        try {
             hookServiceManagerCache("phone", "com.android.internal.telephony.ITelephony") { method, args, target ->
                 handleTelephonyCall(method, args, target)
             }
-
-            hookActivityManagerSingleton()
-
-            Log.i(TAG, "All Binder & ServiceManager hooks successfully initialized")
         } catch (t: Throwable) {
-            Log.e(TAG, "Error initializing Binder hooks", t)
+            Log.w(TAG, "Telephony hook skipped: ${t.message}")
         }
+
+        try {
+            hookActivityManagerSingleton()
+        } catch (t: Throwable) {
+            Log.w(TAG, "ActivityManager hook skipped: ${t.message}")
+        }
+
+        Log.i(TAG, "Binder & ServiceManager virtualization hooks initialized: $hookedServices")
     }
 
     /**
-     * Intercepts ServiceManager.sCache to provide our proxied IBinder
+     * Intercepts ServiceManager.sCache to provide our proxied IBinder that delegates
+     * to the genuine IInterface instance rather than the raw BinderProxy.
      */
     private fun hookServiceManagerCache(
         serviceName: String,
@@ -54,6 +65,12 @@ object BinderHookManager {
             val getServiceMethod = serviceManagerClass.getDeclaredMethod("getService", String::class.java)
             val realBinder = getServiceMethod.invoke(null, serviceName) as? IBinder ?: return
 
+            // Retrieve the genuine IInterface instance from the Stub class
+            val stubClass = Class.forName("$interfaceDescriptor\$Stub")
+            val asInterfaceMethod = stubClass.getDeclaredMethod("asInterface", IBinder::class.java)
+            asInterfaceMethod.isAccessible = true
+            val realInterface = asInterfaceMethod.invoke(null, realBinder) ?: return
+
             val sCacheField = serviceManagerClass.getDeclaredField("sCache")
             sCacheField.isAccessible = true
             @Suppress("UNCHECKED_CAST")
@@ -62,12 +79,12 @@ object BinderHookManager {
             val proxiedBinder = Proxy.newProxyInstance(
                 serviceManagerClass.classLoader,
                 arrayOf(IBinder::class.java),
-                BinderProxyHandler(realBinder, interfaceDescriptor, interceptor)
+                BinderProxyHandler(realBinder, realInterface, interfaceDescriptor, interceptor)
             ) as IBinder
 
             sCache[serviceName] = proxiedBinder
             hookedServices.add(serviceName)
-            Log.i(TAG, "Hooked ServiceManager service: $serviceName")
+            Log.i(TAG, "Successfully hooked ServiceManager service: $serviceName")
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to hook service $serviceName: ${t.message}")
         }
@@ -82,7 +99,6 @@ object BinderHookManager {
             val mInstanceField = singletonClass.getDeclaredField("mInstance")
             mInstanceField.isAccessible = true
 
-            // Hook ActivityManager / ActivityTaskManager
             val amClass = Class.forName("android.app.ActivityManager")
             val singletonField = try {
                 amClass.getDeclaredField("IActivityManagerSingleton")
@@ -114,6 +130,7 @@ object BinderHookManager {
 
     private class BinderProxyHandler(
         private val baseBinder: IBinder,
+        private val realInterface: Any,
         private val interfaceDescriptor: String,
         private val interceptor: (Method, Array<out Any>?, Any) -> Any?
     ) : InvocationHandler {
@@ -126,24 +143,34 @@ object BinderHookManager {
                         targetClass.classLoader,
                         arrayOf(targetClass, IInterface::class.java),
                         InvocationHandler { _, ifaceMethod, ifaceArgs ->
-                            interceptor(ifaceMethod, ifaceArgs, baseBinder)
+                            try {
+                                interceptor(ifaceMethod, ifaceArgs, realInterface)
+                            } catch (t: Throwable) {
+                                invokeSafely(ifaceMethod, realInterface, ifaceArgs)
+                            }
                         }
                     )
                 } catch (e: Exception) {
                     Log.w(TAG, "Could not proxy interface $interfaceDescriptor: ${e.message}")
                 }
             }
-            return if (args != null) method.invoke(baseBinder, *args) else method.invoke(baseBinder)
+
+            // Standard IBinder methods (transact, linkToDeath, pingBinder, etc.) delegate to realBinder
+            return try {
+                if (args != null) method.invoke(baseBinder, *args) else method.invoke(baseBinder)
+            } catch (t: Throwable) {
+                val cause = t.cause ?: t
+                throw cause
+            }
         }
     }
 
-    private fun handlePackageManagerCall(method: Method, args: Array<out Any>?, target: Any): Any? {
+    private fun handlePackageManagerCall(method: Method, args: Array<out Any>?, realInterface: Any): Any? {
         val methodName = method.name
         when (methodName) {
             "getPackageInfo" -> {
                 val pkgName = args?.getOrNull(0) as? String
                 if (pkgName != null && VirtualPackageManagerService.isAppInstalled(pkgName)) {
-                    val installed = VirtualPackageManagerService.getInstalledApp(pkgName)
                     VirtualCore.recordSecurityLog(
                         packageName = pkgName,
                         type = SecurityEventType.IPC_INTERCEPTED,
@@ -166,10 +193,10 @@ object BinderHookManager {
                 }
             }
         }
-        return invokeSafely(method, target, args)
+        return invokeSafely(method, realInterface, args)
     }
 
-    private fun handleAppOpsCall(method: Method, args: Array<out Any>?, target: Any): Any? {
+    private fun handleAppOpsCall(method: Method, args: Array<out Any>?, realInterface: Any): Any? {
         when (method.name) {
             "checkOperation", "checkAudioOperation" -> {
                 val code = (args?.getOrNull(0) as? Number)?.toInt() ?: 0
@@ -184,10 +211,10 @@ object BinderHookManager {
                 return VirtualAppOpsService.noteOperation(code, uid, pkg)
             }
         }
-        return invokeSafely(method, target, args)
+        return invokeSafely(method, realInterface, args)
     }
 
-    private fun handleTelephonyCall(method: Method, args: Array<out Any>?, target: Any): Any? {
+    private fun handleTelephonyCall(method: Method, args: Array<out Any>?, realInterface: Any): Any? {
         val pkg = "virtual.guest"
         when (method.name) {
             "getDeviceId", "getImei", "getMeid" -> {
@@ -200,10 +227,10 @@ object BinderHookManager {
                 return DeviceSpoofManager.getFakePhoneNumber()
             }
         }
-        return invokeSafely(method, target, args)
+        return invokeSafely(method, realInterface, args)
     }
 
-    private fun handleActivityManagerCall(method: Method, args: Array<out Any>?, target: Any): Any? {
+    private fun handleActivityManagerCall(method: Method, args: Array<out Any>?, realInterface: Any): Any? {
         if (method.name == "startActivity") {
             VirtualCore.recordSecurityLog(
                 packageName = "virtual.guest",
@@ -212,7 +239,7 @@ object BinderHookManager {
                 detail = "Routing guest activity intent through Virtual Engine"
             )
         }
-        return invokeSafely(method, target, args)
+        return invokeSafely(method, realInterface, args)
     }
 
     private fun invokeSafely(method: Method, target: Any, args: Array<out Any>?): Any? {
