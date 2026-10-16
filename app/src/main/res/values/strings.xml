@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">Knox Sandbox</string>
+    <string name="dashboard_title">Virtual Container Engine</string>
+    <string name="install_apk">Install APK</string>
+    <string name="pick_apk_file">Pick APK File</string>
+    <string name="clone_installed_app">Clone Host App</string>
+    <string name="no_apps_installed">No virtual applications installed yet.\nTap + to install an APK into the isolated container.</string>
+    <string name="app_details">Virtual App Control Panel</string>
+    <string name="launch_app">Launch App</string>
+    <string name="force_stop">Force Stop</string>
+    <string name="wipe_data">Wipe Sandbox Data</string>
+    <string name="uninstall">Uninstall</string>
+    <string name="security_logs">Security &amp; Isolation Logs</string>
+    <string name="device_spoofing">Hardware &amp; ID Spoofing</string>
+    <string name="running">Running</string>
+    <string name="stopped">Stopped</string>
+    <string name="status">Status</string>
+</resources>
