@@ -36,6 +36,12 @@ object VirtualActivityManagerService {
                 action = Intent.ACTION_MAIN
                 addCategory(Intent.CATEGORY_LAUNCHER)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                putExtra(StubActivity.EXTRA_TARGET_PKG, packageName)
+                putExtra(StubActivity.EXTRA_TARGET_ACTIVITY, targetActivity)
+                putExtra(StubActivity.EXTRA_APK_PATH, app.apkPath)
+                putExtra(StubActivity.EXTRA_APP_NAME, app.appName)
+                putExtra(StubActivity.EXTRA_DATA_DIR, app.dataDir)
+                putExtra(StubActivity.EXTRA_LIB_DIR, app.libDir)
             }
 
             val launchIntent = Intent().apply {
@@ -43,6 +49,10 @@ object VirtualActivityManagerService {
                 putExtra(StubActivity.EXTRA_TARGET_INTENT, targetIntent)
                 putExtra(StubActivity.EXTRA_TARGET_PKG, packageName)
                 putExtra(StubActivity.EXTRA_TARGET_ACTIVITY, targetActivity)
+                putExtra(StubActivity.EXTRA_APK_PATH, app.apkPath)
+                putExtra(StubActivity.EXTRA_APP_NAME, app.appName)
+                putExtra(StubActivity.EXTRA_DATA_DIR, app.dataDir)
+                putExtra(StubActivity.EXTRA_LIB_DIR, app.libDir)
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             }
 

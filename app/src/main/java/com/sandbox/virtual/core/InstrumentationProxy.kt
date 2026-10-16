@@ -97,6 +97,12 @@ class InstrumentationProxy(
     }
 
     override fun newActivity(cl: ClassLoader, className: String, intent: Intent): Activity {
+        // If the system is instantiating one of our pre-registered StubActivities,
+        // let it instantiate normally so StubActivity can manage the host window & guest lifecycle
+        if (className.contains("StubActivity")) {
+            return base.newActivity(cl, className, intent)
+        }
+
         val targetPkg = intent.getStringExtra(StubActivity.EXTRA_TARGET_PKG)
         val targetActivity = intent.getStringExtra(StubActivity.EXTRA_TARGET_ACTIVITY)
 
@@ -121,7 +127,14 @@ class InstrumentationProxy(
     }
 
     override fun callActivityOnCreate(activity: Activity, icicle: Bundle?) {
-        base.callActivityOnCreate(activity, icicle)
+        try {
+            base.callActivityOnCreate(activity, icicle)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Exception during callActivityOnCreate for ${activity.javaClass.name}: ${t.message}", t)
+            if (activity !is StubActivity) {
+                throw t
+            }
+        }
     }
 
     override fun callActivityOnResume(activity: Activity) {

@@ -154,8 +154,8 @@ class SandboxViewModel : ViewModel() {
             val list = mutableListOf<HostAppItem>()
 
             for (info in installed) {
-                // Filter out system apps that are not launchable or our own app
-                if (info.packageName != context.packageName && (info.flags and ApplicationInfo.FLAG_SYSTEM) == 0) {
+                // Allow any app that has a launcher intent and is not our own host app
+                if (info.packageName != context.packageName && pm.getLaunchIntentForPackage(info.packageName) != null) {
                     val name = pm.getApplicationLabel(info).toString()
                     list.add(HostAppItem(info.packageName, name, info.sourceDir))
                 }

@@ -86,12 +86,27 @@ object HCallbackHook {
         }
 
         private fun unwrapIntent(stubIntent: Intent, targetField: Field, targetObj: Any) {
+            try {
+                stubIntent.setExtrasClassLoader(StubActivity::class.java.classLoader)
+            } catch (e: Exception) {
+                // ignore
+            }
+
+            // If the intent is already targeting a registered StubActivity, keep it intact
+            // so StubActivity can be created by ActivityThread and host the guest application
+            val componentCls = stubIntent.component?.className ?: ""
+            if (componentCls.contains("StubActivity")) {
+                Log.i(TAG, "Preserving StubActivity launch intent ($componentCls) with target extras intact")
+                return
+            }
+
             val realIntent = stubIntent.getParcelableExtra<Intent>(StubActivity.EXTRA_TARGET_INTENT)
             val realPkg = stubIntent.getStringExtra(StubActivity.EXTRA_TARGET_PKG)
             val realActivity = stubIntent.getStringExtra(StubActivity.EXTRA_TARGET_ACTIVITY)
 
             if (realIntent != null && realPkg != null) {
                 Log.i(TAG, "Unwrapped stub intent -> Target Activity: $realActivity in $realPkg")
+                stubIntent.extras?.let { realIntent.putExtras(it) }
                 targetField.set(targetObj, realIntent)
             }
         }

@@ -62,9 +62,20 @@ object VirtualPackageManagerService {
     }
 
     /**
+     * Normalize relative component class names (e.g. ".MainActivity" -> "com.example.app.MainActivity")
+     */
+    fun normalizeClassName(pkgName: String, clsName: String): String {
+        return when {
+            clsName.startsWith(".") -> pkgName + clsName
+            !clsName.contains(".") -> "$pkgName.$clsName"
+            else -> clsName
+        }
+    }
+
+    /**
      * Install an APK file into the virtual container
      */
-    fun installPackage(sourceApk: File): Result<InstalledAppInfo> {
+    fun installPackage(sourceApk: File, overrideMainActivity: String? = null): Result<InstalledAppInfo> {
         return try {
             val pm = context.packageManager
             val flags = PackageManager.GET_ACTIVITIES or
@@ -112,9 +123,12 @@ object VirtualPackageManagerService {
                 Log.w(TAG, "Could not extract full resources for $packageName: ${e.message}")
             }
 
-            // Extract main launch activity
-            val activities = pkgInfo.activities?.map { it.name } ?: emptyList()
-            val mainActivity = findMainActivity(pkgInfo) ?: activities.firstOrNull() ?: ""
+            // Normalize all component names to prevent relative ClassNotFoundException
+            val activities = pkgInfo.activities?.map { normalizeClassName(packageName, it.name) } ?: emptyList()
+            val mainActivity = overrideMainActivity?.let { normalizeClassName(packageName, it) }
+                ?: findMainActivity(pkgInfo)
+                ?: activities.firstOrNull()
+                ?: ""
 
             val installedApp = InstalledAppInfo(
                 packageName = packageName,
@@ -130,14 +144,14 @@ object VirtualPackageManagerService {
                 assignedProcessIndex = installedApps.size % 10,
                 requestedPermissions = pkgInfo.requestedPermissions?.toList() ?: emptyList(),
                 activities = activities,
-                services = pkgInfo.services?.map { it.name } ?: emptyList(),
-                receivers = pkgInfo.receivers?.map { it.name } ?: emptyList(),
-                providers = pkgInfo.providers?.map { it.name } ?: emptyList()
+                services = pkgInfo.services?.map { normalizeClassName(packageName, it.name) } ?: emptyList(),
+                receivers = pkgInfo.receivers?.map { normalizeClassName(packageName, it.name) } ?: emptyList(),
+                providers = pkgInfo.providers?.map { normalizeClassName(packageName, it.name) } ?: emptyList()
             )
 
             installedApps[packageName] = installedApp
             saveDatabase()
-            Log.i(TAG, "Successfully installed $packageName (${installedApp.appName}) into sandbox")
+            Log.i(TAG, "Successfully installed $packageName (${installedApp.appName}) with mainActivity=$mainActivity into sandbox")
             Result.success(installedApp)
         } catch (t: Throwable) {
             Log.e(TAG, "Error installing APK ${sourceApk.name}", t)
@@ -153,7 +167,13 @@ object VirtualPackageManagerService {
             val pm = context.packageManager
             val appInfo = pm.getApplicationInfo(packageName, 0)
             val hostApk = File(appInfo.sourceDir)
-            installPackage(hostApk)
+
+            // Extract the exact launcher activity from the host package manager
+            val launchIntent = pm.getLaunchIntentForPackage(packageName)
+            val launcherActivity = launchIntent?.component?.className
+            Log.i(TAG, "Cloning host app $packageName, resolved launcher activity: $launcherActivity")
+
+            installPackage(hostApk, overrideMainActivity = launcherActivity)
         } catch (t: Throwable) {
             Log.e(TAG, "Error cloning host app $packageName", t)
             Result.failure(t)
@@ -170,17 +190,30 @@ object VirtualPackageManagerService {
         return removed
     }
 
-    fun getInstalledApp(packageName: String): InstalledAppInfo? = installedApps[packageName]
+    fun getInstalledApp(packageName: String): InstalledAppInfo? {
+        if (!installedApps.containsKey(packageName)) {
+            loadDatabase()
+        }
+        return installedApps[packageName]
+    }
 
-    fun getAllInstalledApps(): List<InstalledAppInfo> = installedApps.values.toList()
+    fun getAllInstalledApps(): List<InstalledAppInfo> {
+        loadDatabase()
+        return installedApps.values.toList()
+    }
 
-    fun isAppInstalled(packageName: String): Boolean = installedApps.containsKey(packageName)
+    fun isAppInstalled(packageName: String): Boolean {
+        if (!installedApps.containsKey(packageName)) {
+            loadDatabase()
+        }
+        return installedApps.containsKey(packageName)
+    }
 
     fun resolveActivity(intent: Intent): ActivityInfo? {
         val pkg = intent.`package` ?: intent.component?.packageName
         val cls = intent.component?.className
-        if (pkg != null && installedApps.containsKey(pkg)) {
-            val app = installedApps[pkg]!!
+        val app = getInstalledApp(pkg ?: return null)
+        if (app != null) {
             val targetClass = cls ?: app.mainActivity
             val ai = ActivityInfo()
             ai.packageName = pkg
@@ -197,13 +230,19 @@ object VirtualPackageManagerService {
     }
 
     private fun findMainActivity(pkgInfo: PackageInfo): String? {
-        pkgInfo.activities?.forEach { act ->
-            // In most standard manifests, the launch activity is exported or standard named
-            if (act.name.endsWith("MainActivity") || act.name.endsWith("SplashActivity")) {
-                return act.name
+        val activities = pkgInfo.activities ?: return null
+        for (act in activities) {
+            val norm = normalizeClassName(pkgInfo.packageName, act.name)
+            if (norm.endsWith("MainActivity") || norm.endsWith("SplashActivity") || norm.endsWith("LauncherActivity")) {
+                return norm
             }
         }
-        return pkgInfo.activities?.firstOrNull()?.name
+        for (act in activities) {
+            if (act.exported) {
+                return normalizeClassName(pkgInfo.packageName, act.name)
+            }
+        }
+        return activities.firstOrNull()?.let { normalizeClassName(pkgInfo.packageName, it.name) }
     }
 
     private fun getResourcesForApk(apkFile: File): Resources {
