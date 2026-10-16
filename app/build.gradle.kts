@@ -6,7 +6,6 @@ plugins {
 android {
     namespace = "com.sandbox.virtual"
     compileSdk = 34
-    ndkVersion = "25.1.8937393"
 
     defaultConfig {
         applicationId = "com.sandbox.virtual"

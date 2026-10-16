@@ -23,10 +23,14 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Accept Android Licenses & Set Up NDK/CMake
+      - name: Configure Android SDK & Accept Licenses
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "ndk;25.1.8937393" "cmake;3.22.1"
+          SDKMANAGER=$(find ${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools -name sdkmanager -type f | head -n 1)
+          if [ -n "$SDKMANAGER" ]; then
+            echo "Found sdkmanager at $SDKMANAGER"
+            yes | "$SDKMANAGER" --licenses || true
+            "$SDKMANAGER" "cmake;3.22.1" || true
+          fi
 
       - name: Grant Execute Permission to gradlew
         run: chmod +x gradlew
