@@ -99,10 +99,10 @@ open class StubActivity : Activity() {
         var targetActivity = intent?.getStringExtra(EXTRA_TARGET_ACTIVITY)
 
         if (targetPkg.isNullOrEmpty() && targetIntent != null) {
-            targetPkg = targetIntent.`package` ?: targetIntent.component?.packageName
+            targetPkg = targetIntent.getStringExtra(EXTRA_TARGET_PKG) ?: targetIntent.`package` ?: targetIntent.component?.packageName
         }
         if (targetActivity.isNullOrEmpty() && targetIntent != null) {
-            targetActivity = targetIntent.component?.className
+            targetActivity = targetIntent.getStringExtra(EXTRA_TARGET_ACTIVITY) ?: targetIntent.component?.className
         }
 
         Log.i(TAG, "StubActivity onCreate: pid=${android.os.Process.myPid()}, targetPkg=$targetPkg, targetActivity=$targetActivity")

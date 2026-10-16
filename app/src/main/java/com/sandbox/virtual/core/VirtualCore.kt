@@ -172,6 +172,44 @@ object VirtualCore {
     }
 
     /**
+     * Create Resources for an external APK with multiple fallback layers
+     */
+    fun createGuestResources(context: Context, apkPath: String): Resources {
+        // Layer 1: Official PackageManager API (Standard & Most Reliable across Android 8-14)
+        try {
+            val pm = context.packageManager
+            val pkgInfo = pm.getPackageArchiveInfo(apkPath, 0)
+            if (pkgInfo != null) {
+                pkgInfo.applicationInfo.sourceDir = apkPath
+                pkgInfo.applicationInfo.publicSourceDir = apkPath
+                val res = pm.getResourcesForApplication(pkgInfo.applicationInfo)
+                if (res != null) {
+                    return res
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "PM getResourcesForApplication notice: ${e.message}")
+        }
+
+        // Layer 2: AssetManager reflection with accessible constructor
+        try {
+            val constructor = AssetManager::class.java.getDeclaredConstructor().apply { isAccessible = true }
+            val assetManager = constructor.newInstance()
+            val addAssetPath = AssetManager::class.java.getDeclaredMethod("addAssetPath", String::class.java).apply {
+                isAccessible = true
+            }
+            addAssetPath.invoke(assetManager, apkPath)
+            val hostRes = context.resources
+            return Resources(assetManager, hostRes.displayMetrics, hostRes.configuration)
+        } catch (e: Exception) {
+            Log.w(TAG, "AssetManager reflection notice: ${e.message}")
+        }
+
+        // Layer 3: Host resources fallback
+        return context.resources
+    }
+
+    /**
      * Launch guest activity inside StubActivity container host window
      */
     fun launchGuestActivity(
@@ -181,33 +219,44 @@ object VirtualCore {
         targetIntent: Intent,
         savedInstanceState: Bundle?
     ) {
+        // 1. Resolve InstalledAppInfo with Intent Extras fallback (Guarantees app is never null)
+        val apkPathFromIntent = hostActivity.intent?.getStringExtra(StubActivity.EXTRA_APK_PATH) ?: ""
+        val appNameFromIntent = hostActivity.intent?.getStringExtra(StubActivity.EXTRA_APP_NAME) ?: targetPkg
+        val dataDirFromIntent = hostActivity.intent?.getStringExtra(StubActivity.EXTRA_DATA_DIR) ?: ""
+        val libDirFromIntent = hostActivity.intent?.getStringExtra(StubActivity.EXTRA_LIB_DIR) ?: ""
+        val activityFromIntent = hostActivity.intent?.getStringExtra(StubActivity.EXTRA_TARGET_ACTIVITY) ?: ""
+
+        var app = VirtualPackageManagerService.getInstalledApp(targetPkg)
+        if (app == null) {
+            val apkFile = if (apkPathFromIntent.isNotEmpty() && File(apkPathFromIntent).exists()) {
+                File(apkPathFromIntent)
+            } else {
+                VirtualFileSystem.getApkFile(targetPkg)
+            }
+
+            app = InstalledAppInfo(
+                packageName = targetPkg,
+                appName = appNameFromIntent,
+                versionName = "1.0",
+                versionCode = 1L,
+                apkPath = apkFile.absolutePath,
+                dataDir = if (dataDirFromIntent.isNotEmpty()) dataDirFromIntent else VirtualFileSystem.getDataDir(targetPkg).absolutePath,
+                libDir = if (libDirFromIntent.isNotEmpty()) libDirFromIntent else VirtualFileSystem.getLibDir(targetPkg).absolutePath,
+                mainActivity = if (activityFromIntent.isNotEmpty()) activityFromIntent else targetActivityName
+            )
+        }
+
+        val finalActivityName = when {
+            targetActivityName.isNotEmpty() -> VirtualPackageManagerService.normalizeClassName(targetPkg, targetActivityName)
+            activityFromIntent.isNotEmpty() -> VirtualPackageManagerService.normalizeClassName(targetPkg, activityFromIntent)
+            app.mainActivity.isNotEmpty() -> VirtualPackageManagerService.normalizeClassName(targetPkg, app.mainActivity)
+            else -> ""
+        }
+
+        var guestActivityInstance: Activity? = null
+        var launchError: Throwable? = null
+
         try {
-            // 1. Resolve InstalledAppInfo with fallback recovery
-            var app = VirtualPackageManagerService.getInstalledApp(targetPkg)
-            if (app == null) {
-                val apkFile = VirtualFileSystem.getApkFile(targetPkg)
-                if (apkFile.exists()) {
-                    val res = VirtualPackageManagerService.installPackage(apkFile)
-                    app = res.getOrNull()
-                } else {
-                    // Try to resolve from host package manager if cloned
-                    try {
-                        val pm = hostActivity.packageManager
-                        val hostAppInfo = pm.getApplicationInfo(targetPkg, 0)
-                        val res = VirtualPackageManagerService.cloneHostApp(targetPkg)
-                        app = res.getOrNull()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Could not resolve app info from host PM: ${e.message}")
-                    }
-                }
-            }
-
-            if (app == null) {
-                Log.e(TAG, "Cannot launch: app info not found for $targetPkg")
-                renderEmptyContainerUI(hostActivity, targetPkg)
-                return
-            }
-
             // 2. Setup POSIX I/O isolation rules
             VirtualFileSystem.setupIsolationRules(targetPkg)
 
@@ -222,86 +271,78 @@ object VirtualCore {
                 app.apkPath
             )
 
-            // 5. Build guest AssetManager and Resources
-            val assetManager = AssetManager::class.java.getDeclaredConstructor().newInstance()
-            val addAssetPath = AssetManager::class.java.getDeclaredMethod("addAssetPath", String::class.java)
-            addAssetPath.invoke(assetManager, app.apkPath)
+            // 5. Build guest Resources & AssetManager
+            val guestRes = createGuestResources(hostActivity, app.apkPath)
+            val guestAssets = guestRes.assets
 
-            val hostRes = hostActivity.resources
-            val guestRes = Resources(assetManager, hostRes.displayMetrics, hostRes.configuration)
+            // Build guest Theme with AppCompat style so AndroidX / Material Activities work seamlessly
+            val guestTheme = guestRes.newTheme()
+            try {
+                guestTheme.applyStyle(androidx.appcompat.R.style.Theme_AppCompat_DayNight_NoActionBar, true)
+            } catch (e: Exception) {
+                guestTheme.applyStyle(android.R.style.Theme_DeviceDefault_NoActionBar, true)
+            }
 
             // 6. Hook StubActivity environment
             if (hostActivity is StubActivity) {
-                hostActivity.setGuestEnvironment(guestRes, assetManager, guestClassLoader, null, targetPkg)
+                hostActivity.setGuestEnvironment(guestRes, guestAssets, guestClassLoader, guestTheme, targetPkg)
             }
 
             // Inject into ContextImpl
             try {
                 val base = hostActivity.baseContext
-                val resField = base.javaClass.getDeclaredField("mResources")
-                resField.isAccessible = true
+                val resField = base.javaClass.getDeclaredField("mResources").apply { isAccessible = true }
                 resField.set(base, guestRes)
             } catch (e: Throwable) {
                 // Ignore ContextImpl reflection variants
             }
             try {
                 val base = hostActivity.baseContext
-                val clField = base.javaClass.getDeclaredField("mClassLoader")
-                clField.isAccessible = true
+                val clField = base.javaClass.getDeclaredField("mClassLoader").apply { isAccessible = true }
                 clField.set(base, guestClassLoader)
             } catch (e: Throwable) {
                 // Ignore ContextImpl reflection variants
             }
 
-            val finalActivityName = if (targetActivityName.isNotEmpty()) {
-                VirtualPackageManagerService.normalizeClassName(targetPkg, targetActivityName)
-            } else if (app.mainActivity.isNotEmpty()) {
-                VirtualPackageManagerService.normalizeClassName(targetPkg, app.mainActivity)
-            } else {
-                ""
-            }
-
             Log.i(TAG, "Launching sandboxed app $targetPkg -> $finalActivityName (PID: ${Process.myPid()})")
 
-            var guestActivityInstance: Activity? = null
-            var launchError: Throwable? = null
-
-            // 7. Attempt real guest Activity instantiation and attachment
+            // 7. Attempt real guest Activity instantiation and execution
             if (finalActivityName.isNotEmpty()) {
                 try {
                     val guestClass = guestClassLoader.loadClass(finalActivityName)
-                    val activityObj = guestClass.getDeclaredConstructor().newInstance() as Activity
+                    val activityObj = guestClass.getDeclaredConstructor().apply { isAccessible = true }.newInstance() as Activity
 
-                    attachGuestActivity(hostActivity, activityObj, targetIntent, app, guestRes)
+                    val attached = attachGuestActivity(hostActivity, activityObj, targetIntent, app, guestRes)
+                    if (attached) {
+                        try {
+                            activityObj.setTheme(androidx.appcompat.R.style.Theme_AppCompat_DayNight_NoActionBar)
+                        } catch (e: Exception) {}
 
-                    val onCreateMethod = Activity::class.java.getDeclaredMethod("onCreate", Bundle::class.java)
-                    onCreateMethod.isAccessible = true
-                    onCreateMethod.invoke(activityObj, savedInstanceState)
+                        val onCreateMethod = Activity::class.java.getDeclaredMethod("onCreate", Bundle::class.java).apply {
+                            isAccessible = true
+                        }
+                        onCreateMethod.invoke(activityObj, savedInstanceState)
 
-                    try {
-                        val onStartMethod = Activity::class.java.getDeclaredMethod("onStart")
-                        onStartMethod.isAccessible = true
-                        onStartMethod.invoke(activityObj)
-                    } catch (e: Exception) {
-                        // ignore
+                        try {
+                            val onStartMethod = Activity::class.java.getDeclaredMethod("onStart").apply { isAccessible = true }
+                            onStartMethod.invoke(activityObj)
+                        } catch (e: Exception) {}
+
+                        try {
+                            val onResumeMethod = Activity::class.java.getDeclaredMethod("onResume").apply { isAccessible = true }
+                            onResumeMethod.invoke(activityObj)
+                        } catch (e: Exception) {}
+
+                        guestActivityInstance = activityObj
+                        if (hostActivity is StubActivity) {
+                            hostActivity.activeGuestActivity = activityObj
+                        }
+                        Log.i(TAG, "Guest activity $finalActivityName successfully attached and running")
                     }
-
-                    try {
-                        val onResumeMethod = Activity::class.java.getDeclaredMethod("onResume")
-                        onResumeMethod.isAccessible = true
-                        onResumeMethod.invoke(activityObj)
-                    } catch (e: Exception) {
-                        // ignore
-                    }
-
-                    guestActivityInstance = activityObj
-                    if (hostActivity is StubActivity) {
-                        hostActivity.activeGuestActivity = activityObj
-                    }
-                    Log.i(TAG, "Guest activity $finalActivityName successfully attached and running")
                 } catch (t: Throwable) {
-                    Log.w(TAG, "Direct guest activity attach notice: ${t.message}", t)
-                    launchError = t
+                    val cause = t.cause ?: t
+                    Log.w(TAG, "Direct guest activity attach notice: ${cause.message}", cause)
+                    launchError = cause
                 }
             }
 
@@ -321,8 +362,9 @@ object VirtualCore {
                 detail = "Package: $targetPkg, Activity: $finalActivityName, PID: ${Process.myPid()}"
             )
         } catch (t: Throwable) {
-            Log.e(TAG, "Fatal error launching guest activity", t)
-            renderEmptyContainerUI(hostActivity, targetPkg)
+            val cause = t.cause ?: t
+            Log.e(TAG, "Fatal notice launching guest activity: ${cause.message}", cause)
+            renderSandboxContainerUI(hostActivity, app, finalActivityName, cause)
         }
     }
 
@@ -335,85 +377,94 @@ object VirtualCore {
         targetIntent: Intent,
         app: InstalledAppInfo,
         guestRes: Resources
-    ) {
-        val attachMethod = Activity::class.java.declaredMethods.firstOrNull { it.name == "attach" }
-            ?: throw NoSuchMethodException("Activity.attach method not found")
+    ): Boolean {
+        return try {
+            val attachMethod = Activity::class.java.declaredMethods.firstOrNull { it.name == "attach" }
+                ?: return false
 
-        attachMethod.isAccessible = true
-        val paramTypes = attachMethod.parameterTypes
-        val args = arrayOfNulls<Any>(paramTypes.size)
+            attachMethod.isAccessible = true
+            val paramTypes = attachMethod.parameterTypes
+            val args = arrayOfNulls<Any>(paramTypes.size)
 
-        val mTokenField = Activity::class.java.getDeclaredField("mToken").apply { isAccessible = true }
-        val hostToken = mTokenField.get(hostActivity)
+            val hostToken = try {
+                val f = Activity::class.java.getDeclaredField("mToken").apply { isAccessible = true }
+                f.get(hostActivity)
+            } catch (e: Exception) { null }
 
-        val mIdentField = try {
-            Activity::class.java.getDeclaredField("mIdent").apply { isAccessible = true }
-        } catch (e: Exception) {
-            null
-        }
-        val hostIdent = mIdentField?.get(hostActivity) ?: 0
+            val hostIdent = try {
+                val f = Activity::class.java.getDeclaredField("mIdent").apply { isAccessible = true }
+                f.get(hostActivity) as? Int ?: 0
+            } catch (e: Exception) { 0 }
 
-        val mActivityThreadField = Activity::class.java.getDeclaredField("mMainThread").apply { isAccessible = true }
-        val hostActivityThread = mActivityThreadField.get(hostActivity)
+            val hostActivityThread = try {
+                val f = Activity::class.java.getDeclaredField("mMainThread").apply { isAccessible = true }
+                f.get(hostActivity)
+            } catch (e: Exception) { null }
 
-        val mInstrumentationField = Activity::class.java.getDeclaredField("mInstrumentation").apply { isAccessible = true }
-        val hostInstrumentation = mInstrumentationField.get(hostActivity)
+            val hostInstrumentation = try {
+                val f = Activity::class.java.getDeclaredField("mInstrumentation").apply { isAccessible = true }
+                f.get(hostActivity)
+            } catch (e: Exception) { null }
 
-        val actInfo = ActivityInfo().apply {
-            packageName = app.packageName
-            name = app.mainActivity
-            applicationInfo = ApplicationInfo().apply {
+            val actInfo = ActivityInfo().apply {
                 packageName = app.packageName
-                sourceDir = app.apkPath
-                dataDir = app.dataDir
-                nativeLibraryDir = app.libDir
+                name = app.mainActivity
+                applicationInfo = ApplicationInfo().apply {
+                    packageName = app.packageName
+                    sourceDir = app.apkPath
+                    dataDir = app.dataDir
+                    nativeLibraryDir = app.libDir
+                }
             }
-        }
 
-        for (i in paramTypes.indices) {
-            val type = paramTypes[i]
-            args[i] = when {
-                Context::class.java.isAssignableFrom(type) -> hostActivity
-                type.name.contains("ActivityThread") -> hostActivityThread
-                Instrumentation::class.java.isAssignableFrom(type) -> hostInstrumentation
-                IBinder::class.java.isAssignableFrom(type) -> hostToken
-                type == Int::class.javaPrimitiveType || type == Integer::class.java -> hostIdent
-                Application::class.java.isAssignableFrom(type) -> hostActivity.application
-                Intent::class.java.isAssignableFrom(type) -> targetIntent
-                ActivityInfo::class.java.isAssignableFrom(type) -> actInfo
-                CharSequence::class.java.isAssignableFrom(type) -> app.appName
-                Activity::class.java.isAssignableFrom(type) -> null
-                String::class.java.isAssignableFrom(type) -> app.packageName
-                Configuration::class.java.isAssignableFrom(type) -> hostActivity.resources.configuration
-                Window::class.java.isAssignableFrom(type) -> hostActivity.window
-                else -> null
+            for (i in paramTypes.indices) {
+                val type = paramTypes[i]
+                args[i] = when {
+                    Context::class.java.isAssignableFrom(type) -> hostActivity
+                    type.name.contains("ActivityThread") -> hostActivityThread
+                    Instrumentation::class.java.isAssignableFrom(type) -> hostInstrumentation
+                    IBinder::class.java.isAssignableFrom(type) -> hostToken
+                    type == Int::class.javaPrimitiveType || type == Integer::class.java -> hostIdent
+                    Application::class.java.isAssignableFrom(type) -> hostActivity.application
+                    Intent::class.java.isAssignableFrom(type) -> targetIntent
+                    ActivityInfo::class.java.isAssignableFrom(type) -> actInfo
+                    CharSequence::class.java.isAssignableFrom(type) -> app.appName
+                    Activity::class.java.isAssignableFrom(type) -> null
+                    String::class.java.isAssignableFrom(type) -> app.packageName
+                    Configuration::class.java.isAssignableFrom(type) -> hostActivity.resources.configuration
+                    Window::class.java.isAssignableFrom(type) -> hostActivity.window
+                    else -> null
+                }
             }
-        }
 
-        attachMethod.invoke(guestActivity, *args)
+            attachMethod.invoke(guestActivity, *args)
 
-        // Inject resources and theme
-        try {
-            val mResourcesField = Activity::class.java.getDeclaredField("mResources")
-            mResourcesField.isAccessible = true
-            mResourcesField.set(guestActivity, guestRes)
-        } catch (e: Exception) {
-            // ignore
-        }
+            // Inject resources and theme
+            try {
+                val f = Activity::class.java.getDeclaredField("mResources").apply { isAccessible = true }
+                f.set(guestActivity, guestRes)
+            } catch (e: Exception) {}
 
-        try {
-            val theme = guestRes.newTheme()
-            theme.applyStyle(android.R.style.Theme_DeviceDefault_NoActionBar, true)
-            val mThemeField = ContextThemeWrapper::class.java.getDeclaredField("mTheme")
-            mThemeField.isAccessible = true
-            mThemeField.set(guestActivity, theme)
-        } catch (e: Exception) {
-            // ignore
+            try {
+                val theme = guestRes.newTheme()
+                try {
+                    theme.applyStyle(androidx.appcompat.R.style.Theme_AppCompat_DayNight_NoActionBar, true)
+                } catch (e: Exception) {
+                    theme.applyStyle(android.R.style.Theme_DeviceDefault_NoActionBar, true)
+                }
+                val f = ContextThemeWrapper::class.java.getDeclaredField("mTheme").apply { isAccessible = true }
+                f.set(guestActivity, theme)
+            } catch (e: Exception) {}
+
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Notice attaching guest activity: ${t.message}")
+            false
         }
     }
 
     /**
-     * Render the Knox Sandbox Container UI (Guarantees zero black screen under all conditions)
+     * Render the Knox Sandbox Container UI
      */
     fun renderSandboxContainerUI(
         activity: Activity,
@@ -534,6 +585,44 @@ object VirtualCore {
         statusCard.addView(statusHeader)
         statusCard.addView(statusDesc)
         contentLayout.addView(statusCard)
+
+        // Diagnostics Card (if launch notice exists)
+        if (launchError != null) {
+            val errorCard = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding((16 * dp).toInt(), (14 * dp).toInt(), (16 * dp).toInt(), (14 * dp).toInt())
+                val bg = GradientDrawable().apply {
+                    setColor(Color.parseColor("#1C1618"))
+                    cornerRadius = 12 * dp
+                    setStroke((1 * dp).toInt(), Color.parseColor("#D29922"))
+                }
+                background = bg
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    bottomMargin = (16 * dp).toInt()
+                }
+            }
+
+            val errorTitle = TextView(activity).apply {
+                text = "CONTAINER RUNTIME NOTICE"
+                textSize = 12f
+                setTypeface(null, Typeface.BOLD)
+                setTextColor(Color.parseColor("#D29922"))
+            }
+
+            val errorMsg = TextView(activity).apply {
+                text = "${launchError.javaClass.simpleName}: ${launchError.message ?: "Component initialized in background sandbox mode"}"
+                textSize = 12f
+                setTextColor(Color.parseColor("#E6EDF3"))
+                setPadding(0, (4 * dp).toInt(), 0, 0)
+            }
+
+            errorCard.addView(errorTitle)
+            errorCard.addView(errorMsg)
+            contentLayout.addView(errorCard)
+        }
 
         // Virtual Environment Details Card
         val detailsCard = LinearLayout(activity).apply {

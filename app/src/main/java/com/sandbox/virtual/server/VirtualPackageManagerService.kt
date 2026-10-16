@@ -90,8 +90,10 @@ object VirtualPackageManagerService {
             val packageName = pkgInfo.packageName
             val targetApk = VirtualFileSystem.getApkFile(packageName)
 
-            // Copy APK to sandbox
-            sourceApk.copyTo(targetApk, overwrite = true)
+            // Copy APK to sandbox only if source and destination are different
+            if (sourceApk.canonicalPath != targetApk.canonicalPath) {
+                sourceApk.copyTo(targetApk, overwrite = true)
+            }
 
             // Extract native shared libraries
             val libDir = VirtualFileSystem.getLibDir(packageName)
